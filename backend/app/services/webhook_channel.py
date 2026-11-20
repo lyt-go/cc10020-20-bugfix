@@ -74,37 +74,93 @@ class WebhookChannelService(BaseModuleService):
             return {"ok": False, "message": f"事件结构校验失败: {schema_validation['message']}", "event_id": None, "stage": "结构校验", "trace": trace}
 
         # 阶段3：去重判定（跨模块：dedup_filter）
-        event_id = str(uuid.uuid4())
+        # 事件ID优先沿用接入方请求头里的 X-Webhook-Id：同一接入请求重发时它是稳定身份的
+        # 一部分；缺失时才生成新的，避免重发落到一个全新的身份上。
+        event_id = self._resolve_event_id(headers)
         dedup_result = self._check_dedup(channel_id, event_type, payload)
         trace.append({"stage": "去重判定", "passed": dedup_result["ok"], "is_duplicate": dedup_result.get("is_duplicate")})
 
         if dedup_result.get("is_duplicate"):
+            # 去重缓存只是快速路径，重复事件仍要按落湖凭证确认：缓存丢失后重发的事件
+            # 也要能认出分区里的正式记录。未确认前不回写给接入方。
+            sink_result = self._sink_event(event_id, event_type, payload, channel_id, dedup_hit=True)
+            credential = sink_result.get("credential") or {}
+            trace.append({"stage": "数据落湖", "passed": sink_result["ok"],
+                          "detail": sink_result.get("message"), "dedup": sink_result.get("status")})
             self._record_receive_event(channel_id, payload, "duplicate", trace)
-            return {"ok": True, "message": "事件已去重（重复事件）", "event_id": event_id, "stage": "去重判定", "trace": trace, "skipped": True}
+            return {
+                # 重复到达本身不算接入失败；确认状态单独用 ingest_confirmed 表达，
+                # 未确认时接入方据 ok=False 重试。
+                "ok": sink_result["ok"],
+                "message": "事件已去重（重复事件）" if sink_result["ok"] else f"事件重复且落湖未确认: {sink_result.get('message')}",
+                "event_id": sink_result.get("event_id") or event_id,
+                "stage": "去重判定",
+                "trace": trace,
+                "skipped": True,
+                "dedup": True,
+                "ingest_status": sink_result.get("status"),
+                "ingest_confirmed": sink_result["ok"],
+                "credential": credential,
+            }
 
         # 阶段4：分发路由（跨模块：dispatch_rule）
         dispatch_targets = self._match_dispatch_rules(event_type, payload)
         trace.append({"stage": "分发路由", "targets": len(dispatch_targets), "routes": [t.get("目标系统") for t in dispatch_targets]})
 
         # 阶段5：数据落湖（跨模块：data_lake_sink）
-        sink_result = self._sink_event(event_id, event_type, payload, channel_id)
-        trace.append({"stage": "数据落湖", "passed": sink_result["ok"], "detail": sink_result.get("message")})
+        # 落湖凭证决定是否继续写入：已确认的同源事件不再写分区，只回写确认状态。
+        sink_result = self._sink_event(event_id, event_type, payload, channel_id, dedup_hit=False)
+        credential = sink_result.get("credential") or {}
+        trace.append({"stage": "数据落湖", "passed": sink_result["ok"],
+                      "detail": sink_result.get("message"), "ingest_status": sink_result.get("status")})
 
-        # 记录成功接收
+        if not sink_result["ok"]:
+            # 首次写入未确认：不能向接入方返回成功，凭证保持待确认以便重试续做。
+            self._record_receive_event(channel_id, payload, "ingest_unconfirmed", trace)
+            return {
+                "ok": False,
+                "message": f"事件落湖未确认，可重试: {sink_result.get('message')}",
+                "event_id": sink_result.get("event_id") or event_id,
+                "stage": "数据落湖",
+                "trace": trace,
+                "dispatch_targets": [t.get("目标系统") for t in dispatch_targets],
+                "ingest_status": sink_result.get("status"),
+                "ingest_confirmed": False,
+                "credential": credential,
+            }
+
+        # 记录成功接收并累加通道计数。
         self._record_receive_event(channel_id, payload, "success", trace)
         json_store.update(self.MODULE, channel_id, {
             "last_event_at": datetime.now(timezone.utc).isoformat(),
             "total_received": int(channel.get("total_received", 0)) + 1,
         })
 
+        if sink_result.get("status") in ("already", "recovered"):
+            message = ("同源事件已落湖，确认凭证后跳过重复写入"
+                       if sink_result.get("status") == "already"
+                       else "分区已存在正式记录，补确认接入凭证（未重复写入）")
+        else:
+            message = f"事件接收成功，已路由至 {len(dispatch_targets)} 个目标系统"
+
         return {
             "ok": True,
-            "message": f"事件接收成功，已路由至 {len(dispatch_targets)} 个目标系统",
-            "event_id": event_id,
+            "message": message,
+            "event_id": sink_result.get("event_id") or event_id,
             "stage": "完成",
             "trace": trace,
             "dispatch_targets": [t.get("目标系统") for t in dispatch_targets],
+            "ingest_status": sink_result.get("status"),
+            "ingest_confirmed": True,
+            "credential": credential,
         }
+
+    def _resolve_event_id(self, headers: dict[str, str] | None) -> str:
+        """解析接入请求身份：优先接入方请求头，缺失时才生成。"""
+        for key, value in (headers or {}).items():
+            if key.lower() in ("x-webhook-id", "x-event-id", "x-idempotency-key") and value:
+                return f"wh-{value}"
+        return str(uuid.uuid4())
 
     def _verify_signature(self, payload: dict[str, Any], signature: str | None,
                           secret: str, method: str) -> bool:
@@ -135,10 +191,15 @@ class WebhookChannelService(BaseModuleService):
             return {"ok": True, "message": f"结构校验跳过（Schema服务不可用: {e}）"}
 
     def _check_dedup(self, channel_id: int, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """跨模块调用dedup_filter进行事件去重判定。"""
+        """跨模块调用dedup_filter进行事件去重判定。
+
+        复用服务注册表里的去重服务实例：去重缓存只在进程内有效，每次新建实例
+        会让缓存永远为空，重发事件根本判定不出重复。
+        """
         try:
+            from app.services import service_for
             from app.services.dedup_filter import DedupFilterService
-            dedup_svc = DedupFilterService()
+            dedup_svc = service_for("dedup_filter") or DedupFilterService()
             return dedup_svc.check_duplicate(event_type, payload)
         except Exception:
             return {"ok": True, "is_duplicate": False}
@@ -152,14 +213,19 @@ class WebhookChannelService(BaseModuleService):
         except Exception:
             return []
 
-    def _sink_event(self, event_id: str, event_type: str, payload: dict[str, Any], channel_id: int) -> dict[str, Any]:
-        """跨模块调用data_lake_sink进行事件数据落湖。"""
+    def _sink_event(self, event_id: str, event_type: str, payload: dict[str, Any],
+                    channel_id: int, dedup_hit: bool | None = None) -> dict[str, Any]:
+        """跨模块调用data_lake_sink进行事件数据落湖。
+
+        走带幂等凭证的 ingest_event：由凭证决定是否真正写分区，并把确认状态返回给接入方。
+        """
         try:
             from app.services.data_lake_sink import DataLakeSinkService
             sink_svc = DataLakeSinkService()
-            return sink_svc.write_event(event_id, event_type, payload, source_channel_id=channel_id)
+            return sink_svc.ingest_event(event_type, payload, source_channel_id=channel_id,
+                                         request_id=event_id, dedup_hit=dedup_hit)
         except Exception as e:
-            return {"ok": False, "message": f"落湖失败: {e}"}
+            return {"ok": False, "message": f"落湖失败: {e}", "status": "unconfirmed", "credential": None}
 
     def _record_receive_event(self, channel_id: int, payload: dict[str, Any],
                               outcome: str, trace: list[dict[str, Any]]) -> None:
